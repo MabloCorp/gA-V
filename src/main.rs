@@ -2,46 +2,26 @@ use actix_web::{web, App, HttpServer, HttpResponse, put, post};
 use std::fs;
 use std::sync::Mutex;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use sha2::{Sha256, Digest};
 use serde::Serialize;
 
 #[derive(Serialize)]
-struct SafeResponse<'a> {
-    result: &'a str,
-}
-
-#[derive(Serialize)]
-struct MalwareResponseHash<'a> {
-    result: &'a str,
-    detection: &'a str,
-    hash: String,
-}
-
-#[derive(Serialize)]
-struct MalwareResponseYara<'a> {
-    result: &'a str,
-    detection: &'a str,
-    rules: Vec<String>,
+#[serde(untagged)]
+enum ScanResponse {
+    Safe { result: String },
+    MalwareHash { result: String, detection: String, hash: String },
+    MalwareYara { result: String, detection: String, rules: Vec<String> },
 }
 
 type RulesState = web::Data<Mutex<yara_x::Rules>>;
 type HashesState = web::Data<Mutex<HashSet<String>>>;
 
-#[derive(Debug)]
+#[derive(Debug, Default, Serialize)]
 pub struct CompileStats {
     pub success: usize,
     pub failed: usize,
     pub failed_rules: Vec<String>,
-}
-
-impl CompileStats {
-    pub fn new() -> Self {
-        CompileStats {
-            success: 0,
-            failed: 0,
-            failed_rules: Vec::new(),
-        }
-    }
 }
 
 fn load_hashes() -> HashSet<String> {
@@ -54,68 +34,40 @@ fn load_hashes() -> HashSet<String> {
         .collect()
 }
 
-fn compile_rules() -> Result<(yara_x::Rules, CompileStats), String> {
+fn compile_rules() -> (yara_x::Rules, CompileStats) {
     let mut compiler = yara_x::Compiler::new();
-    let mut stats = CompileStats::new();
+    let mut stats = CompileStats::default();
+
+    // Collect all paths
+    let mut paths: Vec<PathBuf> = vec![PathBuf::from("./packages/full/yara-rules-full.yar")];
     
-    // Add main YARA rules file
-    let main_file = "./packages/full/yara-rules-full.yar";
-    match fs::read_to_string(main_file) {
-        Ok(source) => {
-            match compiler.add_source(source.as_str()) {
-                Ok(_) => {
-                    println!("Loaded main YARA rules from: {}", main_file);
-                    stats.success += 1;
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to add main rules: {}", e);
-                    stats.failed += 1;
-                    stats.failed_rules.push(main_file.to_string());
-                }
+    if let Ok(entries) = fs::read_dir("./yaraify") {
+        paths.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "yar")));
+    }
+
+    // Process each path
+    for path in paths {
+        let result = fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|src| compiler.add_source(src.as_str()).map_err(|e| e.to_string()));
+
+        match result {
+            Ok(_) => {
+                stats.success += 1;
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to load {:?}: {}", path, e);
+                stats.failed += 1;
+                stats.failed_rules.push(path.to_string_lossy().to_string());
             }
         }
-        Err(e) => {
-            eprintln!("Warning: Failed to read {}: {}", main_file, e);
-            stats.failed += 1;
-            stats.failed_rules.push(main_file.to_string());
-        }
     }
-    
-    // Add all YARA files from ./yaraify directory
-    let yaraify_dir = "./yaraify";
-    if let Ok(entries) = fs::read_dir(yaraify_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("yar") {
-                    match fs::read_to_string(&path) {
-                        Ok(content) => {
-                            match compiler.add_source(content.as_str()) {
-                                Ok(_) => {
-                                    println!("Loaded YARA rules from: {:?}", path);
-                                    stats.success += 1;
-                                }
-                                Err(e) => {
-                                    eprintln!("Warning: Failed to add rules from {:?}: {}", path, e);
-                                    stats.failed += 1;
-                                    stats.failed_rules.push(path.to_string_lossy().to_string());
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Failed to read {:?}: {}", path, e);
-                            stats.failed += 1;
-                            stats.failed_rules.push(path.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        println!("Warning: ./yaraify directory not found, using only main rules");
-    }
-    
-    Ok((compiler.build(), stats))
+
+    (compiler.build(), stats)
 }
 
 #[put("/send")]
@@ -173,19 +125,13 @@ async fn scan_file(rules_state: RulesState, hashes_state: HashesState, payload: 
 }
 
 #[post("/recompile")]
-async fn recompile_rules(rules_state: RulesState) -> HttpResponse {
-    match compile_rules() {
-        Ok((new_rules, stats)) => {
-            let mut rules = rules_state.lock().unwrap();
-            *rules = new_rules;
-            let response = format!(
-                "Rules recompiled successfully!\nStats: {} loaded, {} failed\nFailed rules: {:?}",
-                stats.success, stats.failed, stats.failed_rules
-            );
-            HttpResponse::Ok().body(response)
-        }
-        Err(e) => HttpResponse::InternalServerError().body(format!("Recompile failed: {}", e))
-    }
+async fn recompile_rules(state: RulesState) -> HttpResponse {
+    let (new_rules, stats) = compile_rules();
+
+    // Lock, swap the data, and drop the lock immediately
+    *state.lock().unwrap() = new_rules;
+
+    HttpResponse::Ok().json(stats)
 }
 
 #[post("/reload_hash")]
@@ -202,13 +148,7 @@ async fn reload_hash(state: HashesState) -> HttpResponse {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     println!("Compiling YARA rules...");
-    let (rules, stats) = match compile_rules() {
-        Ok((r, s)) => (r, s),
-        Err(e) => {
-            eprintln!("Failed to compile rules: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let (rules, stats) = compile_rules();
     println!("Rules compiled successfully!");
     println!("Stats: {} loaded, {} failed", stats.success, stats.failed);
     if !stats.failed_rules.is_empty() {
