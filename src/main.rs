@@ -189,12 +189,14 @@ async fn recompile_rules(rules_state: RulesState) -> HttpResponse {
 }
 
 #[post("/reload_hash")]
-async fn reload_hash(hashes_state: HashesState) -> HttpResponse {
+async fn reload_hash(state: HashesState) -> HttpResponse {
     let new_hashes = load_hashes();
-    let mut hashes = hashes_state.lock().unwrap();
-    *hashes = new_hashes;
-    let response = format!("Hashes reloaded successfully! Loaded {} hashes.", hashes.len());
-    HttpResponse::Ok().body(response)
+    let count = new_hashes.len();
+
+    // Lock, swap the data, and drop the lock immediately
+    *state.lock().unwrap() = new_hashes;
+
+    HttpResponse::Ok().body(format!("Hashes reloaded successfully! {count} signatures active."))
 }
 
 #[actix_web::main]
