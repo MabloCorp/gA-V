@@ -7,6 +7,7 @@ use sha2::{Sha256, Digest};
 use serde::Serialize;
 
 #[derive(Serialize)]
+#[serde(untagged)]
 enum ScanResponse {
     Safe { result: String },
     MalwareHash { result: String, detection: String, hash: String },
@@ -133,21 +134,20 @@ async fn reload_hash(state: HashesState) -> HttpResponse {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    println!("Compiling YARA rules...");
-    let (rules, stats) = compile_rules();
-    println!("Rules compiled\nStats: {} loaded, {} failed", stats.success, stats.failed);
-    if !stats.failed_rules.is_empty() {
-        println!("Failed rules: {:?}", stats.failed_rules);
-    }
+    // Initialize
+    println!("Loading rules...");
 
-    println!("Loading SHA256 hashes...");
+    let (rules, r_stats) = compile_rules();
+    println!("YARA: {} loaded, {} failed", r_stats.success, r_stats.failed);
+    
     let hashes = load_hashes();
-    println!("Loaded {} hashes.", hashes.len());
+    println!("Hash DB: {} signatures active", hashes.len());
 
     let rules_state = web::Data::new(Mutex::new(rules));
     let hashes_state = web::Data::new(Mutex::new(hashes));
 
-    println!("Starting server on http://127.0.0.1:8080");
+    // Web Server
+    println!("Server online at http://127.0.0.1:8080");
 
     HttpServer::new(move || {
         App::new()
@@ -157,7 +157,7 @@ async fn main() -> std::io::Result<()> {
             .service(recompile_rules)
             .service(reload_hash)
     })
-    .bind("127.0.0.1:8080")?
+    .bind(("127.0.0.1", 8080))? // Using a tuple is slightly cleaner
     .run()
     .await
 }
