@@ -7,7 +7,6 @@ use sha2::{Sha256, Digest};
 use serde::Serialize;
 
 #[derive(Serialize)]
-#[serde(untagged)]
 enum ScanResponse {
     Safe { result: String },
     MalwareHash { result: String, detection: String, hash: String },
@@ -70,58 +69,45 @@ fn compile_rules() -> (yara_x::Rules, CompileStats) {
     (compiler.build(), stats)
 }
 
-#[put("/send")]
+#[put("/scan")]
 async fn scan_file(rules_state: RulesState, hashes_state: HashesState, payload: web::Bytes) -> HttpResponse {
-    // Calculate SHA256 of the payload
-    let mut hasher = Sha256::new();
-    hasher.update(&payload);
-    let hash_result = hasher.finalize();
-    let hash_hex = hex::encode(hash_result);
+    let hash_hex = hex::encode(Sha256::digest(&payload));
 
-    // Check if the hash is in the malware list
-    let hashes = hashes_state.lock().unwrap();
-    if hashes.contains(&hash_hex) {
-        let response = MalwareResponseHash {
-            result: "malware",
-            detection: "hash",
-            hash: hash_hex,
-        };
-        return HttpResponse::Ok().json(response);
+    // Hashes
+    {
+        let hashes = hashes_state.lock().unwrap();
+        if hashes.contains(&hash_hex) {
+            return HttpResponse::Ok().json(ScanResponse::MalwareHash {
+                result: "malware".into(),
+                detection: "hash".into(),
+                hash: hash_hex,
+            });
+        }
     }
 
-    // Get the rules and scan
-    let rules = rules_state.lock().unwrap();
-    let mut scanner = yara_x::Scanner::new(&rules);
-    let results = match scanner.scan(&payload) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Scan failed: {}", e);
-            return HttpResponse::InternalServerError().body("Scan failed");
-        }
+    // YARA Scan
+    let yara_matches: Vec<String> = {
+        let rules = rules_state.lock().unwrap();
+        let mut scanner = yara_x::Scanner::new(&rules);
+        
+        let results = scanner.scan(&payload)
+            .expect("YARA scan engine failed unexpectedly");
+
+        results.matching_rules()
+            .map(|r| r.identifier().to_string())
+            .collect()
     };
 
-    // Debug: print summary of scan results
-    let matching_rules = results.matching_rules();
-    let rules_count = matching_rules.len();
+    if !yara_matches.is_empty() {
+        return HttpResponse::Ok().json(ScanResponse::MalwareYara {
+            result: "malware".into(),
+            detection: "YARA".into(),
+            rules: yara_matches,
+        });
+    }
 
-    println!("Scan completed. matching_rules_count={}", rules_count);
-    if rules_count > 0 {
-        println!("Matched rules present (count={})", rules_count);
-    }
-    
-    if rules_count > 0 {
-        let response = MalwareResponseYara {
-            result: "malware",
-            detection: "YARA",
-            rules: matching_rules.map(|r| r.identifier().to_string()).collect(),
-        };
-        HttpResponse::Ok().json(response)
-    } else {
-        let response = SafeResponse {
-            result: "safe",
-        };
-        HttpResponse::Ok().json(response)
-    }
+    // Default to Safe
+    HttpResponse::Ok().json(ScanResponse::Safe { result: "safe".into() })
 }
 
 #[post("/recompile")]
@@ -149,8 +135,7 @@ async fn reload_hash(state: HashesState) -> HttpResponse {
 async fn main() -> std::io::Result<()> {
     println!("Compiling YARA rules...");
     let (rules, stats) = compile_rules();
-    println!("Rules compiled successfully!");
-    println!("Stats: {} loaded, {} failed", stats.success, stats.failed);
+    println!("Rules compiled\nStats: {} loaded, {} failed", stats.success, stats.failed);
     if !stats.failed_rules.is_empty() {
         println!("Failed rules: {:?}", stats.failed_rules);
     }
