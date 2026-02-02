@@ -45,13 +45,13 @@ impl CompileStats {
 }
 
 fn load_hashes() -> HashSet<String> {
-    let mut hashes = HashSet::new();
-    if let Ok(content) = fs::read_to_string("full_sha256.txt") {
-        for line in content.lines() {
-            hashes.insert(line.trim().to_string());
-        }
-    }
-    hashes
+    let content = fs::read_to_string("full_sha256.txt")
+        .expect("Failed to load hash database");
+
+    content
+        .lines()
+        .map(|s| s.trim().to_string())
+        .collect()
 }
 
 fn compile_rules() -> Result<(yara_x::Rules, CompileStats), String> {
